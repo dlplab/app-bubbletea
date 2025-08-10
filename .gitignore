@@ -1,0 +1,74 @@
+config.yaml
+fields.yaml
+presets
+
+# Terraform state & plan files (if launcher and terraform live together)
+terraform
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+crash.log
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go build artifacts
+/bin/
+/build/
+/dist/
+/tmp/
+
+# Go workspace file
+go.work
+
+# Go modules cache (optional)
+# /pkg/mod/
+# /pkg/sumdb/
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Coverage files
+coverage.*
+*.coverprofile
+
+# Bubble Tea session/state (if any)
+*.tea
+
+# Custom app config/secrets
+config.yaml
+*.key
+*.pem
+vault.env
+
+# Presets or data that should not be versioned (customize as needed)
+presets/*.yaml
+
+# Ignore compiled files
+*.a
+
+# Node, Python, etc. (if you use tools for helper scripts)
+node_modules/
+__pycache__/
+
+# Misc
+*.bak
+*.tmp
