@@ -1,28 +1,17 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"crypto/tls"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
+	"sort"
 	"strings"
-	"time"
-
-	vault "github.com/hashicorp/vault/api"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"gopkg.in/yaml.v3"
 )
 
 const uiWidth = 160
@@ -33,68 +22,6 @@ var (
 	normalStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#EEE"))
 	tooltipStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Foreground(lipgloss.Color("240")).Width(uiWidth - 4)
 )
-
-type FieldMeta struct {
-	Label    string `yaml:"label"`
-	Help     string `yaml:"help"`
-	ReadOnly bool   `yaml:"readOnly"`
-	Type     string `yaml:"type"`
-}
-
-// FieldsYaml is the structure for the fields.yaml file
-type FieldsYaml struct {
-	Fields map[string]FieldMeta `yaml:"fields"`
-}
-
-func loadFieldMeta(path string) (map[string]FieldMeta, error) {
-	var fy FieldsYaml
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	if err := yaml.Unmarshal(data, &fy); err != nil {
-		return nil, err
-	}
-	return fy.Fields, nil
-}
-
-type Config struct {
-	Repo          string `yaml:"repo"`
-	AppsPath      string `yaml:"apps_path"`
-	TemplatePath  string `yaml:"template_path"`
-	PresetsPath   string `yaml:"presets_path"`
-	AWSProfile    string `yaml:"aws_profile"`
-	S3Bucket      string `yaml:"s3_bucket"`
-	AWSRegion     string `yaml:"aws_region"`
-	TerraformPath string `yaml:"terraform_path"`
-}
-
-// Utility: check git dirty state and branch
-func getGitStatus(repoPath string) (branch string, dirty bool, err error) {
-	cmd := exec.Command("git", "-C", repoPath, "status", "--porcelain", "--branch")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", false, err
-	}
-	lines := strings.Split(string(out), "\n")
-	branch = "main"
-	if len(lines) > 0 && strings.HasPrefix(lines[0], "## ") {
-		branchLine := lines[0][3:]
-		if idx := strings.Index(branchLine, "..."); idx > 0 {
-			branch = branchLine[:idx]
-		} else if idx := strings.Index(branchLine, " "); idx > 0 {
-			branch = branchLine[:idx]
-		} else {
-			branch = branchLine
-		}
-	}
-	for _, l := range lines[1:] {
-		if len(strings.TrimSpace(l)) > 0 {
-			return branch, true, nil
-		}
-	}
-	return branch, false, nil
-}
 
 func updateStatusBars(m *model) {
 	// AWS
@@ -133,356 +60,6 @@ func updateStatusBars(m *model) {
 	}
 }
 
-func getProxmoxCredsFromVault(cluster string) (apiUrl, tokenId, tokenSecret string, err error) {
-	vaultAddr := os.Getenv("VAULT_ADDR")
-	if vaultAddr == "" {
-		vaultAddr = "http://127.0.0.1:8200" // change as needed
-	}
-	roleID := os.Getenv("TF_VAR_role_id")
-	secretID := os.Getenv("TF_VAR_secret_id")
-	if roleID == "" || secretID == "" {
-		return "", "", "", fmt.Errorf("vault approle credentials not set")
-	}
-
-	cfg := vault.DefaultConfig()
-	cfg.Address = vaultAddr
-	client, err := vault.NewClient(cfg)
-	if err != nil {
-		return "", "", "", err
-	}
-	// Login with AppRole
-	secret, err := client.Logical().Write("auth/approle/login", map[string]interface{}{
-		"role_id":   roleID,
-		"secret_id": secretID,
-	})
-	if err != nil || secret == nil || secret.Auth == nil {
-		return "", "", "", fmt.Errorf("vault appRole login failed: %v", err)
-	}
-	client.SetToken(secret.Auth.ClientToken)
-
-	// Read secret for cluster
-	secretPath := fmt.Sprintf("proxmox_api_keys/data/%s", cluster)
-	kv, err := client.Logical().Read(secretPath)
-	if err != nil || kv == nil || kv.Data == nil {
-		return "", "", "", fmt.Errorf("vault read failed for %s: %v", secretPath, err)
-	}
-	data := kv.Data
-
-	// Vault kv v2 compat
-	if v2, ok := data["data"].(map[string]interface{}); ok {
-		data = v2
-	}
-
-	apiUrl, _ = data["proxmox_api_url"].(string)
-	tokenId, _ = data["proxmox_api_token_id"].(string)
-	tokenSecret, _ = data["proxmox_api_token_secret"].(string)
-	if apiUrl == "" || tokenId == "" || tokenSecret == "" {
-		return "", "", "", fmt.Errorf("missing fields in Vault secret %s", secretPath)
-	}
-	return apiUrl, tokenId, tokenSecret, nil
-}
-
-type ProxmoxVM struct {
-	VmID     int    `json:"vmid"`
-	Name     string `json:"name"`
-	Node     string `json:"node"`
-	Template int    `json:"template"`
-}
-
-func listProxmoxTemplates(apiUrl, tokenId, tokenSecret string) ([]ProxmoxVM, error) {
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // only for trusted internal use!
-		},
-	}
-	url := fmt.Sprintf("https://%s:8006/api2/json/cluster/resources?type=vm", apiUrl)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("PVEAPIToken=%s=%s", tokenId, tokenSecret))
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	var parsed struct {
-		Data []ProxmoxVM `json:"data"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, err
-	}
-	var templates []ProxmoxVM
-	for _, vm := range parsed.Data {
-		if vm.Template == 1 {
-			templates = append(templates, vm)
-		}
-	}
-	return templates, nil
-}
-
-func fetchTemplatesForCluster(cluster string) ([]string, error) {
-	apiURL, tokenID, tokenSecret, err := getProxmoxCredsFromVault(cluster)
-	if err != nil {
-		//fmt.Printf("[DEBUG] Vault error: %v\n", err)
-		return nil, fmt.Errorf("failed to get Proxmox creds from Vault: %w", err)
-	}
-	//fmt.Printf("[DEBUG] Vault returned: apiURL=%q, tokenID=%q\n", apiURL, tokenID)
-
-	vms, err := listProxmoxTemplates(apiURL, tokenID, tokenSecret)
-	if err != nil {
-		//fmt.Printf("[DEBUG] Proxmox API error: %v\n", err)
-		return nil, fmt.Errorf("failed to list Proxmox VMs: %w", err)
-	}
-
-	var templates []string
-	includeRe := regexp.MustCompile(`^ubuntu-server-24\.04\..*`)
-	for _, vm := range vms {
-		if vm.Template == 1 {
-			name := vm.Name
-			// Only include if matches includeRe AND does NOT end with -test
-			if includeRe.MatchString(name) && !strings.HasSuffix(name, "-test") {
-				templates = append(templates, name)
-			}
-		}
-	}
-	//fmt.Printf("[DEBUG] Templates found: %#v\n", templates)
-	return templates, nil
-}
-
-func loadConfig(path string) (Config, error) {
-	var cfg Config
-	f, err := os.ReadFile(path)
-	if err != nil {
-		return cfg, err
-	}
-	err = yaml.Unmarshal(f, &cfg)
-	return cfg, err
-}
-
-type Preset struct {
-	Name   string
-	Values map[string]interface{}
-}
-
-func loadPresets(presetsDir string) ([]Preset, error) {
-	entries, err := os.ReadDir(presetsDir)
-	if err != nil {
-		return nil, err
-	}
-	var out []Preset
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".yaml") {
-			path := filepath.Join(presetsDir, e.Name())
-			values, err := loadPreset(path)
-			if err != nil {
-				continue
-			}
-			name := strings.TrimSuffix(e.Name(), ".yaml")
-			out = append(out, Preset{Name: name, Values: values})
-		}
-	}
-	return out, nil
-}
-func loadPreset(path string) (map[string]interface{}, error) {
-	var out map[string]interface{}
-	f, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	err = yaml.Unmarshal(f, &out)
-	return out, err
-}
-
-func loadTfvars(filename string) (map[string]string, error) {
-	m := make(map[string]string)
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-		m[key] = val
-	}
-	return m, scanner.Err()
-}
-func saveTfvars(filename string, updates map[string]string) error {
-	input, err := os.ReadFile(filename)
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(string(input), "\n")
-	for i, line := range lines {
-		for key, newval := range updates {
-			if strings.HasPrefix(strings.TrimSpace(line), key+" ") || strings.HasPrefix(strings.TrimSpace(line), key+"=") {
-				lines[i] = fmt.Sprintf("%s = %s", key, newval)
-			}
-		}
-	}
-	output := strings.Join(lines, "\n")
-	return os.WriteFile(filename, []byte(output), 0644)
-}
-
-func runTerraformInit(appDir string) error {
-	cmd := exec.Command("terraform", "init", "-input=false")
-	cmd.Dir = appDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("terraform init failed: %v\n%s", err, string(out))
-	}
-	return nil
-}
-
-func runTerraformApply(appDir string) error {
-	cmd := exec.Command("terraform", "apply", "-auto-approve", "-input=false")
-	cmd.Dir = appDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("terraform apply failed: %v\n%s", err, string(out))
-	}
-	return nil
-}
-
-type DeploymentState struct {
-	State      string `yaml:"state"`
-	Timestamp  string `yaml:"timestamp"`
-	LastAction string `yaml:"last_action"`
-}
-
-func setDeploymentState(path string, state string, action string) error {
-	s := DeploymentState{
-		State:      state,
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-		LastAction: action,
-	}
-	data, err := yaml.Marshal(s)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(path, "launcher.state"), data, 0644)
-}
-
-func getDeploymentState(path string) (DeploymentState, error) {
-	var s DeploymentState
-	data, err := os.ReadFile(filepath.Join(path, "launcher.state"))
-	if err != nil {
-		s.State = "UNKNOWN"
-		s.Timestamp = ""
-		s.LastAction = ""
-		return s, err
-	}
-	err = yaml.Unmarshal(data, &s)
-	if err != nil {
-		s.State = "UNKNOWN"
-	}
-	return s, err
-}
-
-// --- Deployments Listing ---
-
-type deploymentInfo struct {
-	Name         string
-	Description  string
-	State        string
-	LastAction   string
-	LastModified string
-	Path         string
-}
-
-func listDeployments(appsDir string) ([]deploymentInfo, error) {
-	entries, err := os.ReadDir(appsDir)
-	if err != nil {
-		return nil, err
-	}
-	var infos []deploymentInfo
-	for _, e := range entries {
-		if e.IsDir() {
-			full := filepath.Join(appsDir, e.Name())
-			stat, err := os.Stat(full)
-			if err != nil {
-				continue
-			}
-			desc := ""
-			tfvarsPath := filepath.Join(full, "terraform.tfvars")
-			if vals, err := loadTfvars(tfvarsPath); err == nil {
-				desc = strings.Trim(vals["platform_description"], "\"")
-			}
-			st, _ := getDeploymentState(full)
-			state := st.State
-			lastAction := ""
-			if st.Timestamp != "" {
-				lastAction = st.Timestamp[:16] // YYYY-MM-DDTHH:MM
-			}
-			infos = append(infos, deploymentInfo{
-				Name:         e.Name(),
-				Description:  desc,
-				State:        state,
-				LastAction:   lastAction,
-				LastModified: stat.ModTime().Format("2006-01-02 15:04"),
-				Path:         full,
-			})
-		}
-	}
-	return infos, nil
-}
-
-func copyDir(src string, dst string) error {
-	srcInfo, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		srcPath := filepath.Join(src, entry.Name())
-		dstPath := filepath.Join(dst, entry.Name())
-		if entry.IsDir() {
-			if err := copyDir(srcPath, dstPath); err != nil {
-				return err
-			}
-		} else {
-			in, err := os.Open(srcPath)
-			if err != nil {
-				return err
-			}
-			defer in.Close()
-			out, err := os.Create(dstPath)
-			if err != nil {
-				return err
-			}
-			defer out.Close()
-			if _, err = io.Copy(out, in); err != nil {
-				return err
-			}
-			info, _ := os.Stat(srcPath)
-			if err = out.Chmod(info.Mode()); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // --- UI Constants, Helpers, and Styles ---
 
 var (
@@ -507,6 +84,7 @@ const (
 	sceneCreateForm
 	sceneEditTable
 	sceneEditForm
+	sceneConfirmDestroy
 )
 
 type model struct {
@@ -543,8 +121,12 @@ type model struct {
 	isFetchingTemplates bool
 
 	// --- NEW FIELDS ---
-	isBusy      bool
-	busyMessage string
+	isBusy bool
+
+	// Destroy confirmation
+	pendingDestroyIdx  int
+	pendingDestroyName string
+	pendingDestroyPath string
 }
 
 func (m model) Init() tea.Cmd {
@@ -556,6 +138,17 @@ func main() {
 	if err != nil {
 		fmt.Println("ERROR: could not load config.yaml:", err)
 		os.Exit(1)
+	}
+	// Optional: load cluster/zone options from clusters.yaml if present
+	if _, err := os.Stat("clusters.yaml"); err == nil {
+		if opts, err := loadOptions("clusters.yaml"); err == nil {
+			if len(opts.Clusters) > 0 {
+				clusterOptions = opts.Clusters
+			}
+			if len(opts.Zones) > 0 {
+				zoneOptions = opts.Zones
+			}
+		}
 	}
 	presets, err := loadPresets(cfg.PresetsPath)
 	if err != nil {
@@ -679,11 +272,13 @@ func (m model) View() string {
 	switch m.currentScene {
 	case sceneLauncher:
 		deployTableStr := m.deployTable.View()
-		tfvarsTableStr := m.tfvarsTable.View()
-		lines1 := strings.Split(deployTableStr, "\n")
-		lines2 := strings.Split(tfvarsTableStr, "\n")
+		selected := m.deployTable.Cursor()
 		col1Width := 89
 		col2Width := 68
+		// Render non-scrollable details for the selected deployment
+		detailsStr := renderDetailsPanel(m.cfg.AppsPath, m.deployments, selected, m.fieldMeta, col2Width, 20)
+		lines1 := strings.Split(deployTableStr, "\n")
+		lines2 := strings.Split(detailsStr, "\n")
 		maxLines := max(len(lines1), len(lines2))
 		for len(lines1) < maxLines {
 			lines1 = append(lines1, strings.Repeat(" ", col1Width))
@@ -735,6 +330,15 @@ func (m model) View() string {
 		} else {
 			tooltip = tooltipStyle.Render(m.fieldMeta[m.editFormLabels[m.editFocusIndex]].Help)
 		}
+	case sceneConfirmDestroy:
+		// Confirmation view
+		title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).Render("Confirm Destroy")
+		body = "\n" + boxSection(centerText(title, uiWidth-4)) + "\n"
+		list := fmt.Sprintf("1) terraform destroy\n2) delete remote state prefix s3://%s/%s/\n3) remove %s directory\n\nContinue?",
+			m.cfg.S3Bucket, filepath.Base(m.pendingDestroyPath), m.pendingDestroyName)
+		body += tooltipStyle.Render(list)
+		// No tooltip here; options are shown in footer only to avoid duplicate boxes
+		tooltip = ""
 	default:
 		body, tooltip = "", ""
 	}
@@ -771,6 +375,11 @@ func footerForScene(m model) string {
 		return centerText("[↑/↓] Field │ [Tab] Next │ [Enter] Save │ [Esc] Cancel", uiWidth)
 	case sceneEditForm:
 		return centerText("[↑/↓] Field │ [Tab] Next │ [Enter] Save │ [A] Apply │ [Esc] Cancel", uiWidth)
+	case sceneConfirmDestroy:
+		keyStyle := lipgloss.NewStyle().Bold(true)
+		opt := fmt.Sprintf("[%s] Yes │ [%s] Plan destroy │ [%s] Cancel",
+			keyStyle.Render("y"), keyStyle.Render("p"), keyStyle.Render("n/Esc"))
+		return centerText(opt, uiWidth)
 	default:
 		return centerText("", uiWidth)
 	}
@@ -853,6 +462,43 @@ func loadTfvarsTableForDeployment(appsPath string, infos []deploymentInfo, idx i
 	return tfvarsTable
 }
 
+// renderDetailsPanel formats the selected deployment's tfvars as non-scrollable text.
+func renderDetailsPanel(appsPath string, infos []deploymentInfo, idx int, fieldMeta map[string]FieldMeta, width int, maxHeight int) string {
+	if idx < 0 || idx >= len(infos) {
+		return strings.Repeat(" ", width)
+	}
+	tfvars, _ := loadTfvars(filepath.Join(infos[idx].Path, "terraform.tfvars"))
+	// Deterministic ordering: sort by label
+	type kv struct{ k, v, label string }
+	var rows []kv
+	for k, v := range tfvars {
+		label := k
+		if meta, ok := fieldMeta[k]; ok && meta.Label != "" {
+			label = meta.Label
+		}
+		rows = append(rows, kv{k: k, v: v, label: label})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].label < rows[j].label })
+	var b strings.Builder
+	// Header
+	b.WriteString(padRight("Details", width))
+	b.WriteString("\n")
+	count := 0
+	for _, r := range rows {
+		line := fmt.Sprintf("%-28s %s", r.label+":", r.v)
+		if len(line) > width {
+			line = line[:width]
+		}
+		b.WriteString(padRight(line, width))
+		b.WriteString("\n")
+		count++
+		if count >= maxHeight-2 { // leave room for header spacing
+			break
+		}
+	}
+	return b.String()
+}
+
 // --- Update logic: only allow quit during isBusy
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.isBusy {
@@ -875,6 +521,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return updateCreateForm(m, msg)
 	case sceneEditForm:
 		return updateEditForm(m, msg)
+	case sceneConfirmDestroy:
+		return updateConfirmDestroy(m, msg)
 	}
 	return m, nil
 }
@@ -912,6 +560,16 @@ func updateLauncher(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentScene = sceneEditForm
 				return m, nil
 			}
+		case "d", "D":
+			idx := m.deployTable.Cursor()
+			if idx >= 0 && idx < len(m.deployments) {
+				dep := m.deployments[idx]
+				m.pendingDestroyIdx = idx
+				m.pendingDestroyName = dep.Name
+				m.pendingDestroyPath = dep.Path
+				m.currentScene = sceneConfirmDestroy
+				return m, nil
+			}
 		case "q", "esc":
 			return m, tea.Quit
 		case "r", "R":
@@ -930,6 +588,64 @@ func updateLauncher(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMessage = "Deployments refreshed!"
 			return m, nil
 
+		}
+	}
+	return m, nil
+}
+
+func updateConfirmDestroy(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "y", "enter":
+			// Proceed with destroy
+			if m.pendingDestroyIdx >= 0 && m.pendingDestroyIdx < len(m.deployments) {
+				dep := m.deployments[m.pendingDestroyIdx]
+				m.statusMessage = "Running terraform destroy..."
+				if err := runTerraformDestroy(dep.Path); err != nil {
+					m.statusMessage = "terraform destroy failed: " + err.Error()
+					m.currentScene = sceneLauncher
+					return m, nil
+				}
+				_ = setDeploymentState(dep.Path, "DESTROYED", "destroy")
+				// Remove S3 prefix (best-effort)
+				appDir := filepath.Base(dep.Path)
+				_ = deleteS3Prefix(m.cfg.S3Bucket, fmt.Sprintf("%s/", appDir), m.cfg.AWSProfile, m.cfg.AWSRegion)
+				// Remove local directory (best-effort)
+				if err := os.RemoveAll(dep.Path); err != nil {
+					m.statusMessage = "Destroyed, but failed to delete directory: " + err.Error()
+				} else {
+					m.statusMessage = "Destroyed: terraform + remote state + directory removed."
+				}
+				// Refresh
+				deployments, _ := listDeployments(m.cfg.AppsPath)
+				m.deployments = deployments
+				deployRows := make([]table.Row, len(deployments))
+				for i, info := range deployments {
+					deployRows[i] = table.Row{info.Name, info.Description, info.State, info.LastAction}
+				}
+				m.deployTable.SetRows(deployRows)
+				m.tfvarsTable = loadTfvarsTableForDeployment(m.cfg.AppsPath, deployments, 0, m.fieldMeta)
+			}
+			m.currentScene = sceneLauncher
+			return m, nil
+		case "p":
+			// Dry-run plan
+			if m.pendingDestroyIdx >= 0 && m.pendingDestroyIdx < len(m.deployments) {
+				dep := m.deployments[m.pendingDestroyIdx]
+				if err := runTerraformPlanDestroy(dep.Path); err != nil {
+					m.statusMessage = "plan -destroy failed: " + err.Error()
+				} else {
+					m.statusMessage = "plan -destroy completed successfully."
+				}
+			}
+			// Keep user in confirm view after plan
+			return m, nil
+		case "n", "esc":
+			// Cancel destroy
+			m.statusMessage = "Destroy canceled."
+			m.currentScene = sceneLauncher
+			return m, nil
 		}
 	}
 	return m, nil
@@ -1243,21 +959,7 @@ func updateCreateForm(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func getEnvStatus(cfg Config) (vaultOK, awsOK bool) {
-	roleID := os.Getenv("TF_VAR_role_id")
-	secretID := os.Getenv("TF_VAR_secret_id")
-	vaultOK = roleID != "" && secretID != ""
-	awsProfile := os.Getenv("AWS_PROFILE")
-	awsRegion := os.Getenv("AWS_REGION")
-	if awsProfile == "" {
-		awsProfile = cfg.AWSProfile
-	}
-	if awsRegion == "" {
-		awsRegion = cfg.AWSRegion
-	}
-	awsOK = awsProfile != "" && awsRegion != ""
-	return
-}
+// getEnvStatus now lives in internal_config.go
 
 func updateEditForm(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {

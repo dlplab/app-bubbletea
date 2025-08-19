@@ -1,0 +1,10 @@
+# Optional: override cluster/zone options presented in the TUI
+clusters:
+  - cl10400
+  - cl12600k
+  - cl12900h
+  - cl13600k
+zones:
+  - standard
+  - admin
+  - dmz
