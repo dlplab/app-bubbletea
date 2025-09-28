@@ -109,7 +109,7 @@ func fetchTemplatesForCluster(cluster string) ([]string, error) {
 		return nil, fmt.Errorf("failed to list Proxmox VMs: %w", err)
 	}
 	var templates []string
-	includeRe := regexp.MustCompile(`^ubuntu-server-24\.04\..*`)
+	includeRe := regexp.MustCompile(`^(ubuntu-server-|talos).*`)
 	for _, vm := range vms {
 		if vm.Template == 1 {
 			name := vm.Name
